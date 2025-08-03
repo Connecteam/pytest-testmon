@@ -2,6 +2,7 @@
 """
 Main module of testmon pytest plugin.
 """
+
 import time
 import xmlrpc.client
 import os
@@ -29,6 +30,11 @@ from testmon.testmon_core import (
 )
 from testmon import configure
 from testmon.common import get_logger, get_system_packages
+from testmon.xdist_coordination import (
+    get_xdist_config,
+    get_controller_state,
+    initialize_worker,
+)
 
 SURVEY_NOTIFICATION_INTERVAL = timedelta(days=28)
 
@@ -175,15 +181,71 @@ def init_testmon_data(config: Config):
                 headers=[("x-api-key", tmnet_api_key)],
             )
 
-    testmon_data = TestmonData(
-        rootdir=config.rootdir.strpath,
-        database=rpc_proxy,
-        environment=environment,
-        system_packages=system_packages,
-        readonly=get_running_as(config) == "worker",
-    )
-    testmon_data.determine_stable(bool(rpc_proxy))
-    config.testmon_data = testmon_data
+    # Check if xdist coordination is enabled
+    xdist_config = get_xdist_config()
+    running_as = get_running_as(config)
+
+    if xdist_config.enabled and running_as in ("controller", "worker"):
+        # Use coordination for xdist
+        if running_as == "controller":
+            # Controller: Initialize normally and pre-create
+            testmon_data = TestmonData(
+                rootdir=config.rootdir.strpath,
+                database=rpc_proxy,
+                environment=environment,
+                system_packages=system_packages,
+                readonly=False,
+            )
+            testmon_data.determine_stable(bool(rpc_proxy))
+            config.testmon_data = testmon_data
+
+            # Pre-create database entries for workers
+            controller_state = get_controller_state()
+            # Get number of workers from xdist
+            num_workers = getattr(config.option, "numprocesses", None)
+            controller_state.initialize(testmon_data, num_workers)
+
+        else:  # worker
+            # Worker: Use pre-created environment
+            worker_id = getattr(config, "workerinput", {}).get("workerid", "unknown")
+            worker_state = initialize_worker(worker_id, config)
+
+            if worker_state and worker_state.is_initialized:
+                # Create TestmonData with readonly=True
+                testmon_data = TestmonData(
+                    rootdir=config.rootdir.strpath,
+                    database=rpc_proxy,
+                    environment=environment,
+                    system_packages=system_packages,
+                    readonly=True,
+                )
+                testmon_data.determine_stable(bool(rpc_proxy))
+                config.testmon_data = testmon_data
+            else:
+                # Fallback to normal initialization if coordination fails
+                logger.warning(
+                    f"Worker {worker_id} coordination failed, using normal init"
+                )
+                testmon_data = TestmonData(
+                    rootdir=config.rootdir.strpath,
+                    database=rpc_proxy,
+                    environment=environment,
+                    system_packages=system_packages,
+                    readonly=True,
+                )
+                testmon_data.determine_stable(bool(rpc_proxy))
+                config.testmon_data = testmon_data
+    else:
+        # Normal initialization (no coordination)
+        testmon_data = TestmonData(
+            rootdir=config.rootdir.strpath,
+            database=rpc_proxy,
+            environment=environment,
+            system_packages=system_packages,
+            readonly=running_as == "worker",
+        )
+        testmon_data.determine_stable(bool(rpc_proxy))
+        config.testmon_data = testmon_data
 
 
 def get_running_as(config):
@@ -217,6 +279,19 @@ def register_plugins(config, should_select, should_collect, cov_plugin):
         )
         if config.pluginmanager.hasplugin("xdist"):
             config.pluginmanager.register(TestmonXdistSync())
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_sessionfinish(session):
+    """Clean up xdist coordination files if we're the controller."""
+    config = session.config
+    xdist_config = get_xdist_config()
+
+    if xdist_config.enabled and get_running_as(config) == "controller":
+        controller_state = get_controller_state()
+        if controller_state.is_initialized:
+            logger.debug("Cleaning up xdist coordination files")
+            controller_state.cleanup()
 
 
 def pytest_configure(config):
@@ -332,9 +407,7 @@ class TestmonCollect:
         self._sessionstarttime = time.time()
 
     @pytest.hookimpl(tryfirst=True, hookwrapper=True)
-    def pytest_pycollect_makeitem(
-        self, collector, name, obj
-    ):  # pylint: disable=unused-argument
+    def pytest_pycollect_makeitem(self, collector, name, obj):  # pylint: disable=unused-argument
         makeitem_result = yield
         items = makeitem_result.get_result() or []
         try:
@@ -345,9 +418,7 @@ class TestmonCollect:
             pass
 
     @pytest.hookimpl(tryfirst=True)
-    def pytest_collection_modifyitems(
-        self, session, config, items
-    ):  # pylint: disable=unused-argument
+    def pytest_collection_modifyitems(self, session, config, items):  # pylint: disable=unused-argument
         should_sync = not session.testsfailed and self._running_as in (
             "single",
             "controller",
@@ -356,9 +427,7 @@ class TestmonCollect:
             config.testmon_data.sync_db_fs_tests(retain=set(self.raw_test_names))
 
     @pytest.hookimpl(hookwrapper=True)
-    def pytest_runtest_protocol(
-        self, item, nextitem
-    ):  # pylint: disable=unused-argument
+    def pytest_runtest_protocol(self, item, nextitem):  # pylint: disable=unused-argument
         self.testmon.start_testmon(item.nodeid, nextitem.nodeid if nextitem else None)
         result = yield
         if result.excinfo and issubclass(result.excinfo[0], BaseException):
@@ -415,9 +484,7 @@ class TestmonXdistSync:
     def pytest_testnodeready(self, node):  # pylint: disable=unused-argument
         self.await_nodes += 1
 
-    def pytest_xdist_node_collection_finished(
-        self, node, ids
-    ):  # pylint: disable=invalid-name
+    def pytest_xdist_node_collection_finished(self, node, ids):  # pylint: disable=invalid-name
         self.await_nodes += -1
         if self.await_nodes == 0:
             node.config.testmon_data.sync_db_fs_tests(retain=set(ids))
@@ -478,9 +545,7 @@ class TestmonSelect:
         return None
 
     @pytest.hookimpl(trylast=True)
-    def pytest_collection_modifyitems(
-        self, session, config, items
-    ):  # pylint: disable=unused-argument
+    def pytest_collection_modifyitems(self, session, config, items):  # pylint: disable=unused-argument
         selected = []
         deselected = []
         for item in items:
