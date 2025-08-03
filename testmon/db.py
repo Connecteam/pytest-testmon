@@ -100,9 +100,7 @@ class DB:  # pylint: disable=too-many-public-methods
                 "UPDATE file_fp SET mtime=?, fsha=? WHERE id = ?", new_mtimes
             )
 
-    def finish_execution(
-        self, exec_id, duration=None, select=True
-    ):  # pylint: disable=unused-argument
+    def finish_execution(self, exec_id, duration=None, select=True):  # pylint: disable=unused-argument
         self.update_saving_stats(exec_id, select)
         self.fetch_or_create_file_fp.cache_clear()
         with self.con as con:
@@ -193,9 +191,7 @@ class DB:  # pylint: disable=too-many-public-methods
         )
 
     @lru_cache(1000)
-    def fetch_or_create_file_fp(
-        self, filename, fsha, method_checksums
-    ):  # pylint: disable=R0801
+    def fetch_or_create_file_fp(self, filename, fsha, method_checksums):  # pylint: disable=R0801
         cursor = self.con.cursor()
         try:
             cursor.execute(
@@ -655,9 +651,9 @@ class DB:  # pylint: disable=too-many-public-methods
                 SELECT
                 id, environment_name, system_packages, python_version
                 FROM environment
-                WHERE environment_name = ?
+                WHERE environment_name = ? and system_packages = ? and python_version = ?
                 """,
-                (environment_name,),
+                (environment_name, system_packages, python_version),
             ).fetchone()
 
             if environment:
